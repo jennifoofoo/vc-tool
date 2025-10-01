@@ -1,0 +1,5 @@
+pandas
+feedparser
+plotly
+streamlit
+python-dotenv
