@@ -3,3 +3,7 @@ feedparser
 plotly
 streamlit
 python-dotenv
+kagglehub
+python-dateutil
+requests
+beautifulsoup4
