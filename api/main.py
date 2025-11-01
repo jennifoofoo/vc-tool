@@ -14,10 +14,11 @@ import logging
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Dict
+from typing import Dict, List, Optional, Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
 
 
 # ---------------------------
@@ -258,16 +259,60 @@ def get_yc_companies(
 # Stats
 # ---------------------------
 
+class StatsNewsSection(BaseModel):
+    total: int
+    by_source: Dict[str, int]
+
+
+class StatsYcSection(BaseModel):
+    total: int
+    by_batch: Dict[str, int]
+    by_industry: Dict[str, int]
+    by_status: Dict[str, int]
+
+
 class StatsResponse(BaseModel):
-    news_counts: Dict[str, int]
-    yc_batches: Dict[str, int]
-    yc_industries: Dict[str, int]
-    yc_status: Dict[str, int]
+    news: Optional[StatsNewsSection] = None
+    yc: Optional[StatsYcSection] = None
+
+
+def _fetch_total(conn: sqlite3.Connection, query: str) -> int:
+    try:
+        logging.info("Executing stats total query: %s", query)
+        cur = conn.execute(query)
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            return 0
+        return int(row[0])
+    except sqlite3.Error as exc:
+        logging.error("Stats total query failed (%s): %s", query, exc)
+        return 0
+
+
+def _fetch_group_counts(conn: sqlite3.Connection, query: str) -> Dict[str, int]:
+    results: Dict[str, int] = {}
+    try:
+        logging.info("Executing stats group query: %s", query)
+        cur = conn.execute(query)
+        for row in cur.fetchall():
+            key = row[0]
+            value = row[1]
+            if key is None or value is None:
+                continue
+            results[str(key)] = int(value)
+    except sqlite3.Error as exc:
+        logging.error("Stats group query failed (%s): %s", query, exc)
+    return results
 
 
 @app.get("/stats", response_model=StatsResponse)
-def get_stats() -> StatsResponse:
-    """Return aggregated statistics across news and YC companies tables."""
+def get_stats(
+    stats_type: Optional[Literal["news", "yc"]] = Query(
+        None,
+        description="Limit stats to a specific dataset: 'news' or 'yc'. Leave empty for both.",
+    )
+) -> JSONResponse:
+    """Return aggregated statistics for news and/or YC companies."""
     try:
         conn = get_db_connection()
     except FileNotFoundError as exc:
@@ -278,71 +323,45 @@ def get_stats() -> StatsResponse:
         raise HTTPException(status_code=500, detail="Database error")
 
     try:
-        news_counts: Dict[str, int] = {}
-        yc_batches: Dict[str, int] = {}
-        yc_industries: Dict[str, int] = {}
-        yc_status: Dict[str, int] = {}
+        include_news = stats_type in (None, "news")
+        include_yc = stats_type in (None, "yc")
 
-        # News per source
-        try:
-            cur = conn.execute(
-                "SELECT source, COUNT(*) as c FROM news GROUP BY source ORDER BY c DESC;"
+        response_payload: Dict[str, BaseModel] = {}
+
+        if include_news:
+            news_total = _fetch_total(conn, "SELECT COUNT(*) FROM news;")
+            news_by_source = _fetch_group_counts(
+                conn,
+                "SELECT source, COUNT(*) FROM news GROUP BY source ORDER BY COUNT(*) DESC;",
             )
-            for row in cur.fetchall():
-                src = row["source"] if row["source"] is not None else "unknown"
-                news_counts[str(src)] = int(row["c"]) if row["c"] is not None else 0
-        except sqlite3.Error as exc:
-            logging.error("SQLite query error (news_counts): %s", exc)
-            raise HTTPException(status_code=500, detail="Database query error (news)")
-
-        # YC batches
-        try:
-            cur = conn.execute(
-                "SELECT batch, COUNT(*) as c FROM yc_companies WHERE batch IS NOT NULL GROUP BY batch ORDER BY c DESC;"
+            response_payload["news"] = StatsNewsSection(
+                total=news_total,
+                by_source=news_by_source,
             )
-            for row in cur.fetchall():
-                b = row["batch"]
-                if b is None:
-                    continue
-                yc_batches[str(b)] = int(row["c"]) if row["c"] is not None else 0
-        except sqlite3.Error as exc:
-            logging.error("SQLite query error (yc_batches): %s", exc)
-            raise HTTPException(status_code=500, detail="Database query error (yc_batches)")
 
-        # YC industries
-        try:
-            cur = conn.execute(
-                "SELECT industry, COUNT(*) as c FROM yc_companies WHERE industry IS NOT NULL GROUP BY industry ORDER BY c DESC;"
+        if include_yc:
+            yc_total = _fetch_total(conn, "SELECT COUNT(*) FROM yc_companies;")
+            yc_by_batch = _fetch_group_counts(
+                conn,
+                "SELECT batch, COUNT(*) FROM yc_companies WHERE batch IS NOT NULL GROUP BY batch ORDER BY COUNT(*) DESC;",
             )
-            for row in cur.fetchall():
-                ind = row["industry"]
-                if ind is None:
-                    continue
-                yc_industries[str(ind)] = int(row["c"]) if row["c"] is not None else 0
-        except sqlite3.Error as exc:
-            logging.error("SQLite query error (yc_industries): %s", exc)
-            raise HTTPException(status_code=500, detail="Database query error (yc_industries)")
-
-        # YC status
-        try:
-            cur = conn.execute(
-                "SELECT status, COUNT(*) as c FROM yc_companies WHERE status IS NOT NULL GROUP BY status ORDER BY c DESC;"
+            yc_by_industry = _fetch_group_counts(
+                conn,
+                "SELECT industry, COUNT(*) FROM yc_companies WHERE industry IS NOT NULL GROUP BY industry ORDER BY COUNT(*) DESC;",
             )
-            for row in cur.fetchall():
-                st = row["status"]
-                if st is None:
-                    continue
-                yc_status[str(st)] = int(row["c"]) if row["c"] is not None else 0
-        except sqlite3.Error as exc:
-            logging.error("SQLite query error (yc_status): %s", exc)
-            raise HTTPException(status_code=500, detail="Database query error (yc_status)")
+            yc_by_status = _fetch_group_counts(
+                conn,
+                "SELECT status, COUNT(*) FROM yc_companies WHERE status IS NOT NULL GROUP BY status ORDER BY COUNT(*) DESC;",
+            )
+            response_payload["yc"] = StatsYcSection(
+                total=yc_total,
+                by_batch=yc_by_batch,
+                by_industry=yc_by_industry,
+                by_status=yc_by_status,
+            )
 
-        return StatsResponse(
-            news_counts=news_counts,
-            yc_batches=yc_batches,
-            yc_industries=yc_industries,
-            yc_status=yc_status,
-        )
+        stats_response = StatsResponse(**{k: v for k, v in response_payload.items()})
+        return JSONResponse(content=stats_response.dict(exclude_none=True))
     finally:
         try:
             conn.close()
